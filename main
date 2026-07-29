@@ -1082,7 +1082,7 @@ HitboxBtn.Font = Enum.Font.GothamBold
 local AutoFarmBtn = CreateButton(ScriptsPage, "🚜 ЗАПУСТИТЬ AUTO FARM SCRIPT", Color3.fromRGB(40, 160, 90), function()
 	task.spawn(function()
 		local success, err = pcall(function()
-			loadstring(game:HttpGet('https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source'))()
+			loadstring(game:HttpGet("https://pastebin.com/raw/BjUC6X2b"))()
 		end)
 		if not success then
 			warn("Ошибка запуска Auto Farm скрипта:", err)
