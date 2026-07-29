@@ -1,0 +1,24 @@
+local PandaAuth = loadstring(game:HttpGet("https://raw.githubusercontent.com/Panda-Developers/PandaKeySystem/main/PandaKeySystem.lua"))()
+
+-- Указываем имя твоего сервиса
+PandaAuth:SetService("reduxub")
+
+-- Проверяем ключ
+if PandaAuth:ValidateKey() then
+    print("Ключ верный! Запускаем GoidaVpnClient...")
+    
+    -- Уведомление
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "ReduxHub",
+            Text = "Скрипт успешно запущен!",
+            Duration = 5
+        })
+    end)
+    
+    -- ЗАПУСК ВАШЕГО ОСНОВНОГО СКРИПТА С GITHUB:
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/Playertpaccept3/GoidaVpnClient/refs/heads/main/main"))()
+
+else
+    print("Ключ не найден или недействителен.")
+end
