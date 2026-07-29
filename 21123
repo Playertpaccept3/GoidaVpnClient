@@ -1,0 +1,831 @@
+-- ЭТОТ СКРИПТ ДОЛЖЕН БЫТЬ В: StarterPlayer -> StarterPlayerScripts -> LocalScript
+local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local SoundService = game:GetService("SoundService")
+local TweenService = game:GetService("TweenService")
+
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+
+-- === 0. АВТОМАТИЧЕСКАЯ ЗАЧИСТКА СТАРОЙ ВЕРСИИ ===
+RunService:UnbindFromRenderStep("CameraStretch")
+
+local oldGui = PlayerGui:FindFirstChild("RayfieldStyleGui")
+if oldGui then oldGui:Destroy() end
+
+local oldStorage = PlayerGui:FindFirstChild("Redux_HiddenObjects")
+if oldStorage then 
+	for _, obj in pairs(oldStorage:GetChildren()) do obj:Destroy() end
+	oldStorage:Destroy() 
+end
+
+-- === ПЕРЕМЕННЫЕ СОСТОЯНИЯ ===
+local isReduxActive = true
+local Resolution = 0.80
+local FootstepVolume = 1.0
+
+-- Пресеты цветов
+local ColorPresets = {
+	{Name = "Серый Redux",       Color = Color3.fromRGB(120, 120, 130)},
+	{Name = "Темно-Серый",        Color = Color3.fromRGB(60, 60, 70)},
+	{Name = "Фиолетовый Redux",   Color = Color3.fromRGB(160, 70, 220)},
+	{Name = "Розовый Redux",       Color = Color3.fromRGB(255, 60, 130)},
+	{Name = "Неоновый Синий",     Color = Color3.fromRGB(0, 150, 255)},
+	{Name = "Кислотный Зеленый",   Color = Color3.fromRGB(50, 220, 100)},
+	{Name = "Красный Закат",      Color = Color3.fromRGB(230, 40, 50)},
+	{Name = "Киберпанк Оранж",    Color = Color3.fromRGB(255, 130, 0)}
+}
+local CurrentColor = ColorPresets[1].Color
+
+-- Кастомный цвет (RGB)
+local CustomColorR = 120
+local CustomColorG = 120
+local CustomColorB = 130
+
+-- Кастомные звуки выстрелов
+local CustomGunSounds = {
+	"rbxassetid://5852470908",
+	"rbxassetid://108840133584674",
+	"rbxassetid://132948338000932",
+	"rbxassetid://74924309961251",
+	"rbxassetid://9125607465"
+}
+local SelectedSoundIndex = 0 
+local globalSoundIndex = 1
+
+-- Звук шагов
+local SingleFootstepId = "rbxassetid://135712042029119"
+
+-- Хранилище сброшенных элементов
+local HiddenStorage = Instance.new("Folder")
+HiddenStorage.Name = "Redux_HiddenObjects"
+HiddenStorage.Parent = PlayerGui
+
+-- Бэкап настроек
+local origClockTime = Lighting.ClockTime
+local origAmbient = Lighting.Ambient
+local origOutdoorAmbient = Lighting.OutdoorAmbient
+local origGlobalShadows = Lighting.GlobalShadows
+local origShadowSoftness = Lighting.ShadowSoftness
+local origQualityLevel = settings().Rendering.QualityLevel
+
+local originalMaterials = {}
+local hiddenObjects = {}
+local originalSoundIds = {}
+local hookedSounds = {}
+
+-- Эффекты Lighting
+local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+local colorCorrection = Lighting:FindFirstChildOfClass("ColorCorrectionEffect")
+local bloom = Lighting:FindFirstChildOfClass("BloomEffect")
+
+local createdAtmosphere, createdColorCorrection, createdBloom = false, false, false
+
+if not atmosphere then atmosphere = Instance.new("Atmosphere") createdAtmosphere = true atmosphere.Parent = Lighting end
+if not colorCorrection then colorCorrection = Instance.new("ColorCorrectionEffect") createdColorCorrection = true colorCorrection.Parent = Lighting end
+if not bloom then bloom = Instance.new("BloomEffect") createdBloom = true bloom.Parent = Lighting end
+
+local origAtmDensity = atmosphere.Density
+local origAtmColor = atmosphere.Color
+local origAtmDecay = atmosphere.Decay
+local origCcBrightness = colorCorrection.Brightness
+local origCcContrast = colorCorrection.Contrast
+local origCcSaturation = colorCorrection.Saturation
+local origCcTintColor = colorCorrection.TintColor
+local origBloomInt = bloom.Intensity
+local origBloomSize = bloom.Size
+local origBloomThresh = bloom.Threshold
+
+-- === 1. СИСТЕМА РАЗРЕШЕНИЯ КАМЕРЫ ===
+RunService:BindToRenderStep("CameraStretch", Enum.RenderPriority.Camera.Value + 1, function()
+	local Camera = Workspace.CurrentCamera
+	if isReduxActive and Camera then
+		Camera.CFrame = Camera.CFrame * CFrame.new(0, 0, 0, 1, 0, 0, 0, Resolution, 0, 0, 0, 1)
+	end
+end)
+
+local function darkenColor(color, amount)
+	return Color3.new(math.max(color.R - amount, 0), math.max(color.G - amount, 0), math.max(color.B - amount, 0))
+end
+
+-- === 2. ОБНОВЛЕНИЕ ЦВЕТА ===
+local function UpdateReduxColors(newColor)
+	if not isReduxActive then return end
+	CurrentColor = newColor
+	Lighting.Ambient = darkenColor(newColor, 0.3)
+	Lighting.OutdoorAmbient = newColor
+	if atmosphere then
+		atmosphere.Color = newColor
+		atmosphere.Decay = darkenColor(newColor, 0.4)
+	end
+	if colorCorrection then
+		colorCorrection.TintColor = newColor:Lerp(Color3.fromRGB(255, 255, 255), 0.7)
+	end
+end
+
+-- === 3. СТРОГАЯ ТАРГЕТНАЯ ФИЛЬТРАЦИЯ (ТОЛЬКО ВЫСТРЕЛЫ И ШАГИ) ===
+local function GetNextGunSound()
+	if SelectedSoundIndex > 0 then
+		return CustomGunSounds[SelectedSoundIndex]
+	else
+		local id = CustomGunSounds[globalSoundIndex]
+		globalSoundIndex = (globalSoundIndex % #CustomGunSounds) + 1
+		return id
+	end
+end
+
+local function IsUISound(sound)
+	return sound:IsDescendantOf(PlayerGui) or sound:IsDescendantOf(game:GetService("CoreGui"))
+end
+
+local function IsGunSound(sound)
+	if IsUISound(sound) then return false end
+	local name = sound.Name:lower()
+	local gunKeywords = {"fire", "shot", "shoot", "bang", "blast"}
+	
+	for _, kw in ipairs(gunKeywords) do
+		if name:find(kw) then
+			return true
+		end
+	end
+	return false
+end
+
+local function IsFootstepSound(sound)
+	if IsUISound(sound) then return false end
+	local name = sound.Name:lower()
+	local stepKeywords = {"step", "run", "foot", "walk", "running"}
+	
+	for _, kw in ipairs(stepKeywords) do
+		if name:find(kw) then
+			return true
+		end
+	end
+	return false
+end
+
+local function ApplySoundModification(sound)
+	if not sound:IsA("Sound") or IsUISound(sound) then return end
+
+	local isGun = IsGunSound(sound)
+	local isStep = IsFootstepSound(sound)
+
+	-- Если это НЕ выстрел и НЕ шаг — игнорируем!
+	if not isGun and not isStep then return end
+
+	if not originalSoundIds[sound] then
+		originalSoundIds[sound] = sound.SoundId
+	end
+
+	if isStep then
+		sound.SoundId = SingleFootstepId
+		sound.Volume = FootstepVolume
+	elseif isGun then
+		sound.SoundId = GetNextGunSound()
+	end
+end
+
+local function HookSoundEvents(sound)
+	if not sound:IsA("Sound") or IsUISound(sound) or hookedSounds[sound] then return end
+	
+	local isGun = IsGunSound(sound)
+	local isStep = IsFootstepSound(sound)
+
+	if not isGun and not isStep then return end
+
+	hookedSounds[sound] = true
+	ApplySoundModification(sound)
+
+	sound.Played:Connect(function()
+		if not isReduxActive then return end
+		if IsGunSound(sound) then
+			sound.SoundId = GetNextGunSound()
+		end
+	end)
+end
+
+local function ForceRefreshSounds()
+	local searchContainers = { Workspace, SoundService, Player.Backpack }
+	if Player.Character then table.insert(searchContainers, Player.Character) end
+
+	for _, container in ipairs(searchContainers) do
+		for _, object in pairs(container:GetDescendants()) do
+			if object:IsA("Sound") then
+				HookSoundEvents(object)
+			end
+		end
+	end
+end
+
+game.DescendantAdded:Connect(function(obj)
+	if obj:IsA("Sound") then 
+		HookSoundEvents(obj) 
+	end
+end)
+
+if Player.Character then ForceRefreshSounds() end
+Player.CharacterAdded:Connect(function(char)
+	task.wait(0.5)
+	ForceRefreshSounds()
+end)
+
+-- === 4. ОПТИМИЗАЦИЯ И FPS BOOST ===
+local function ActivateFPSBoost()
+	settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+	Lighting.GlobalShadows = false
+	Lighting.ShadowSoftness = 0
+	Lighting.ClockTime = 16.5
+
+	for _, object in pairs(Workspace:GetDescendants()) do
+		if object:IsA("BasePart") then
+			if not originalMaterials[object] then
+				originalMaterials[object] = {mat = object.Material, shadow = object.CastShadow, ref = object.Reflectance}
+			end
+			object.Material = Enum.Material.SmoothPlastic
+			object.CastShadow = false
+			object.Reflectance = 0
+		elseif object:IsA("Decal") or object:IsA("Texture") or object:IsA("SunRaysEffect") or object:IsA("Clouds") then
+			table.insert(hiddenObjects, {obj = object, oldParent = object.Parent})
+			object.Parent = HiddenStorage
+		elseif object:IsA("ParticleEmitter") or object:IsA("Smoke") or object:IsA("Fire") or object:IsA("Sparkles") then
+			object.Enabled = false
+			table.insert(hiddenObjects, {obj = object, isParticle = true})
+		end
+	end
+
+	if atmosphere then atmosphere.Density = 0.25 atmosphere.Glare = 0 atmosphere.Haze = 1 end
+	if colorCorrection then colorCorrection.Brightness = 0.15 colorCorrection.Contrast = 0.3 colorCorrection.Saturation = 0.5 end
+	if bloom then bloom.Intensity = 0.5 bloom.Size = 14 bloom.Threshold = 0.85 end
+	
+	UpdateReduxColors(CurrentColor)
+	ForceRefreshSounds()
+end
+
+-- === 5. ПОЛНЫЙ СБРОС И ЗАКРЫТИЕ ===
+local function DeactivateAndReset()
+	if not isReduxActive then return end
+	isReduxActive = false
+	RunService:UnbindFromRenderStep("CameraStretch")
+
+	settings().Rendering.QualityLevel = origQualityLevel
+	Lighting.ClockTime = origClockTime
+	Lighting.Ambient = origAmbient
+	Lighting.OutdoorAmbient = origOutdoorAmbient
+	Lighting.GlobalShadows = origGlobalShadows
+	Lighting.ShadowSoftness = origShadowSoftness
+
+	if atmosphere and atmosphere.Parent then
+		if createdAtmosphere then atmosphere:Destroy() else atmosphere.Density = origAtmDensity atmosphere.Color = origAtmColor atmosphere.Decay = origAtmDecay end
+	end
+	if colorCorrection and colorCorrection.Parent then
+		if createdColorCorrection then colorCorrection:Destroy() else colorCorrection.Brightness = origCcBrightness colorCorrection.Contrast = origCcContrast colorCorrection.Saturation = origCcSaturation colorCorrection.TintColor = origCcTintColor end
+	end
+	if bloom and bloom.Parent then
+		if createdBloom then bloom:Destroy() else bloom.Intensity = origBloomInt bloom.Size = origBloomSize bloom.Threshold = origBloomThresh end
+	end
+
+	for part, orig in pairs(originalMaterials) do
+		if part and part.Parent then
+			part.Material = orig.mat
+			part.CastShadow = orig.shadow
+			part.Reflectance = orig.ref
+		end
+	end
+
+	for _, data in pairs(hiddenObjects) do
+		if data.obj then
+			if data.isParticle then data.obj.Enabled = true elseif data.oldParent then data.obj.Parent = data.oldParent end
+		end
+	end
+
+	for sound, oldId in pairs(originalSoundIds) do
+		if sound and sound.Parent then sound.SoundId = oldId end
+	end
+
+	if HiddenStorage then HiddenStorage:Destroy() end
+	local gui = PlayerGui:FindFirstChild("RayfieldStyleGui")
+	if gui then gui:Destroy() end
+	script:Destroy()
+end
+
+-- === 6. GUI С АНИМАЦИЯМИ (RAYFIELD STYLE) ===
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "RayfieldStyleGui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.DisplayOrder = 1000
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = PlayerGui
+
+-- Кнопка восстановления
+local OpenBtn = Instance.new("TextButton")
+OpenBtn.Size = UDim2.new(0, 160, 0, 36)
+OpenBtn.Position = UDim2.new(0, 15, 0.5, -18)
+OpenBtn.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+OpenBtn.Text = "⚡ REDUX HUB"
+OpenBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+OpenBtn.Font = Enum.Font.GothamBold
+OpenBtn.TextSize = 12
+OpenBtn.Visible = false
+OpenBtn.Parent = ScreenGui
+Instance.new("UICorner", OpenBtn).CornerRadius = UDim.new(0, 8)
+
+local OpenStroke = Instance.new("UIStroke")
+OpenStroke.Color = Color3.fromRGB(120, 120, 140)
+OpenStroke.Thickness = 1.5
+OpenStroke.Parent = OpenBtn
+
+-- Главное окно
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 0, 0, 0)
+MainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+MainFrame.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.ClipsDescendants = true
+MainFrame.Parent = ScreenGui
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+
+local MainUIStroke = Instance.new("UIStroke")
+MainUIStroke.Color = Color3.fromRGB(45, 45, 60)
+MainUIStroke.Thickness = 1
+MainUIStroke.Parent = MainFrame
+
+-- Анимации открытия/сворачивания
+local function AnimateOpen()
+	OpenBtn.Visible = false
+	MainFrame.Visible = true
+	MainFrame.Size = UDim2.new(0, 0, 0, 0)
+	MainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+	
+	local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	local tween = TweenService:Create(MainFrame, tweenInfo, {
+		Size = UDim2.new(0, 570, 0, 440),
+		Position = UDim2.new(0.5, 0, 0.5, 0)
+	})
+	tween:Play()
+end
+
+local function AnimateMinimize()
+	local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+	local tween = TweenService:Create(MainFrame, tweenInfo, {
+		Size = UDim2.new(0, 0, 0, 0),
+		Position = UDim2.new(0.5, 0, 0.5, 0)
+	})
+	tween:Play()
+	tween.Completed:Connect(function()
+		MainFrame.Visible = false
+		OpenBtn.Visible = true
+		OpenBtn.Size = UDim2.new(0, 0, 0, 36)
+		TweenService:Create(OpenBtn, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			Size = UDim2.new(0, 160, 0, 36)
+		}):Play()
+	end)
+end
+
+OpenBtn.MouseButton1Click:Connect(AnimateOpen)
+
+-- Шапка
+local TopBar = Instance.new("Frame")
+TopBar.Size = UDim2.new(1, 0, 0, 42)
+TopBar.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainFrame
+Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 10)
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -60, 1, 0)
+Title.Position = UDim2.new(0, 15, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "REDUX & SOUND HUB v3.5"
+Title.TextColor3 = Color3.fromRGB(220, 220, 245)
+Title.TextSize = 13
+Title.Font = Enum.Font.GothamBold
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = TopBar
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 28, 0, 28)
+CloseBtn.Position = UDim2.new(1, -35, 0, 7)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(40, 30, 40)
+CloseBtn.Text = "—"
+CloseBtn.TextColor3 = Color3.fromRGB(255, 200, 100)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 14
+CloseBtn.Parent = TopBar
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
+
+CloseBtn.MouseButton1Click:Connect(AnimateMinimize)
+
+local Container = Instance.new("Frame")
+Container.Size = UDim2.new(1, 0, 1, -67)
+Container.Position = UDim2.new(0, 0, 0, 42)
+Container.BackgroundTransparency = 1
+Container.Parent = MainFrame
+
+local TabsFrame = Instance.new("Frame")
+TabsFrame.Size = UDim2.new(0, 145, 1, 0)
+TabsFrame.BackgroundColor3 = Color3.fromRGB(19, 19, 26)
+TabsFrame.BorderSizePixel = 0
+TabsFrame.Parent = Container
+
+local TabsList = Instance.new("UIListLayout")
+TabsList.Padding = UDim.new(0, 6)
+TabsList.Parent = TabsFrame
+
+local TabsPadding = Instance.new("UIPadding")
+TabsPadding.PaddingTop = UDim.new(0, 10)
+TabsPadding.PaddingLeft = UDim.new(0, 10)
+TabsPadding.Parent = TabsFrame
+
+local Pages = Instance.new("Folder")
+Pages.Name = "Pages"
+Pages.Parent = Container
+
+local function CreatePage(name, isActive)
+	local Page = Instance.new("ScrollingFrame")
+	Page.Name = name
+	Page.Size = UDim2.new(1, -165, 1, -10)
+	Page.Position = UDim2.new(0, 155, 0, 5)
+	Page.BackgroundTransparency = 1
+	Page.BorderSizePixel = 0
+	Page.Visible = isActive
+	Page.ScrollBarThickness = 4
+	Page.ScrollBarImageColor3 = Color3.fromRGB(120, 120, 140)
+	Page.CanvasSize = UDim2.new(0, 0, 0, 0)
+	Page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	Page.Parent = Pages
+
+	local ListLayout = Instance.new("UIListLayout")
+	ListLayout.Padding = UDim.new(0, 8)
+	ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	ListLayout.Parent = Page
+
+	local TabBtn = Instance.new("TextButton")
+	TabBtn.Size = UDim2.new(0, 125, 0, 32)
+	TabBtn.BackgroundColor3 = isActive and Color3.fromRGB(120, 120, 140) or Color3.fromRGB(26, 26, 36)
+	TabBtn.Text = name
+	TabBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	TabBtn.Font = Enum.Font.GothamMedium
+	TabBtn.TextSize = 12
+	TabBtn.Parent = TabsFrame
+	Instance.new("UICorner", TabBtn).CornerRadius = UDim.new(0, 6)
+
+	TabBtn.MouseButton1Click:Connect(function()
+		for _, p in pairs(Pages:GetChildren()) do p.Visible = false end
+		for _, b in pairs(TabsFrame:GetChildren()) do if b:IsA("TextButton") then b.BackgroundColor3 = Color3.fromRGB(26, 26, 36) end end
+		Page.Visible = true
+		TabBtn.BackgroundColor3 = Color3.fromRGB(120, 120, 140)
+	end)
+
+	return Page
+end
+
+-- Вкладки
+local MainPage = CreatePage("Графика & Цвет", true)
+local SoundPage = CreatePage("Звуки выстрелов", false)
+local FootstepPage = CreatePage("Звуки бега", false)
+
+-- Нижняя плашка
+local BottomBar = Instance.new("Frame")
+BottomBar.Size = UDim2.new(1, 0, 0, 25)
+BottomBar.Position = UDim2.new(0, 0, 1, -25)
+BottomBar.BackgroundColor3 = Color3.fromRGB(12, 12, 18)
+BottomBar.BorderSizePixel = 0
+BottomBar.Parent = MainFrame
+Instance.new("UICorner", BottomBar).CornerRadius = UDim.new(0, 8)
+
+local BottomText = Instance.new("TextLabel")
+BottomText.Size = UDim2.new(1, -20, 1, 0)
+BottomText.Position = UDim2.new(0, 10, 0, 0)
+BottomText.BackgroundTransparency = 1
+BottomText.Text = "💡 Нажмите [L] для выключения | [—] для сворачивания"
+BottomText.TextColor3 = Color3.fromRGB(140, 140, 160)
+BottomText.TextSize = 10
+BottomText.Font = Enum.Font.GothamMedium
+BottomText.TextXAlignment = Enum.TextXAlignment.Left
+BottomText.Parent = BottomBar
+
+-- Элементы управления
+local function CreateButton(parent, text, color, cb)
+	local Btn = Instance.new("TextButton")
+	Btn.Size = UDim2.new(1, -10, 0, 36)
+	Btn.BackgroundColor3 = color
+	Btn.Text = text
+	Btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	Btn.Font = Enum.Font.GothamMedium
+	Btn.TextSize = 12
+	Btn.Parent = parent
+	Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 6)
+	Btn.MouseButton1Click:Connect(cb)
+	return Btn
+end
+
+local function CreateDropdown(parent, titleText, options, onSelect)
+	local DropdownFrame = Instance.new("Frame")
+	DropdownFrame.Size = UDim2.new(1, -10, 0, 58)
+	DropdownFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 34)
+	DropdownFrame.BorderSizePixel = 0
+	DropdownFrame.ZIndex = 10
+	DropdownFrame.Parent = parent
+	Instance.new("UICorner", DropdownFrame).CornerRadius = UDim.new(0, 6)
+
+	local Label = Instance.new("TextLabel")
+	Label.Size = UDim2.new(1, -20, 0, 20)
+	Label.Position = UDim2.new(0, 10, 0, 5)
+	Label.BackgroundTransparency = 1
+	Label.Text = titleText
+	Label.TextColor3 = Color3.fromRGB(180, 180, 200)
+	Label.Font = Enum.Font.GothamMedium
+	Label.TextSize = 11
+	Label.TextXAlignment = Enum.TextXAlignment.Left
+	Label.ZIndex = 11
+	Label.Parent = DropdownFrame
+
+	local MainBtn = Instance.new("TextButton")
+	MainBtn.Size = UDim2.new(1, -20, 0, 26)
+	MainBtn.Position = UDim2.new(0, 10, 0, 26)
+	MainBtn.BackgroundColor3 = Color3.fromRGB(33, 33, 46)
+	MainBtn.Text = "  " .. options[1].Name .. "  ▼"
+	MainBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	MainBtn.Font = Enum.Font.Gotham
+	MainBtn.TextSize = 12
+	MainBtn.TextXAlignment = Enum.TextXAlignment.Left
+	MainBtn.ZIndex = 11
+	MainBtn.Parent = DropdownFrame
+	Instance.new("UICorner", MainBtn).CornerRadius = UDim.new(0, 5)
+
+	local ListContainer = Instance.new("ScrollingFrame")
+	ListContainer.Size = UDim2.new(1, -20, 0, 0)
+	ListContainer.Position = UDim2.new(0, 10, 0, 54)
+	ListContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 42)
+	ListContainer.BorderSizePixel = 0
+	ListContainer.Visible = false
+	ListContainer.ZIndex = 500
+	ListContainer.ScrollBarThickness = 3
+	ListContainer.CanvasSize = UDim2.new(0, 0, 0, #options * 26)
+	ListContainer.Parent = DropdownFrame
+	Instance.new("UICorner", ListContainer).CornerRadius = UDim.new(0, 5)
+
+	local ListLayout = Instance.new("UIListLayout")
+	ListLayout.Parent = ListContainer
+
+	local isOpen = false
+	MainBtn.MouseButton1Click:Connect(function()
+		isOpen = not isOpen
+		ListContainer.Visible = isOpen
+		DropdownFrame.Size = isOpen and UDim2.new(1, -10, 0, 58 + math.min(#options * 26, 110)) or UDim2.new(1, -10, 0, 58)
+		ListContainer.Size = isOpen and UDim2.new(1, -20, 0, math.min(#options * 26, 110)) or UDim2.new(1, -20, 0, 0)
+	end)
+
+	for _, opt in ipairs(options) do
+		local OptBtn = Instance.new("TextButton")
+		OptBtn.Size = UDim2.new(1, 0, 0, 26)
+		OptBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 42)
+		OptBtn.Text = "  " .. opt.Name
+		OptBtn.TextColor3 = Color3.fromRGB(200, 200, 220)
+		OptBtn.Font = Enum.Font.Gotham
+		OptBtn.TextSize = 11
+		OptBtn.TextXAlignment = Enum.TextXAlignment.Left
+		OptBtn.ZIndex = 501
+		OptBtn.Parent = ListContainer
+
+		OptBtn.MouseButton1Click:Connect(function()
+			MainBtn.Text = "  " .. opt.Name .. "  ▼"
+			isOpen = false
+			ListContainer.Visible = false
+			DropdownFrame.Size = UDim2.new(1, -10, 0, 58)
+			onSelect(opt)
+		end)
+	end
+end
+
+local function CreateSlider(parent, text, min, max, default, isPercent, callback)
+	local SliderFrame = Instance.new("Frame")
+	SliderFrame.Size = UDim2.new(1, -10, 0, 60)
+	SliderFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 34)
+	SliderFrame.BorderSizePixel = 0
+	SliderFrame.Parent = parent
+	Instance.new("UICorner", SliderFrame).CornerRadius = UDim.new(0, 6)
+
+	local Label = Instance.new("TextLabel")
+	Label.Size = UDim2.new(1, -20, 0, 20)
+	Label.Position = UDim2.new(0, 10, 0, 6)
+	Label.BackgroundTransparency = 1
+	Label.Text = isPercent and string.format("%s: %d%%", text, math.floor(default * 100)) or string.format("%s: %.2f", text, default)
+	Label.TextColor3 = Color3.fromRGB(200, 200, 220)
+	Label.Font = Enum.Font.GothamMedium
+	Label.TextSize = 11
+	Label.TextXAlignment = Enum.TextXAlignment.Left
+	Label.Parent = SliderFrame
+
+	local ClickArea = Instance.new("TextButton")
+	ClickArea.Size = UDim2.new(1, -20, 0, 28)
+	ClickArea.Position = UDim2.new(0, 10, 0, 26)
+	ClickArea.BackgroundTransparency = 1
+	ClickArea.Text = ""
+	ClickArea.Parent = SliderFrame
+
+	local Track = Instance.new("Frame")
+	Track.Size = UDim2.new(1, 0, 0, 10)
+	Track.Position = UDim2.new(0, 0, 0.5, -5)
+	Track.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+	Track.BorderSizePixel = 0
+	Track.Parent = ClickArea
+	Instance.new("UICorner", Track).CornerRadius = UDim.new(0, 5)
+
+	local Fill = Instance.new("Frame")
+	local initRatio = (default - min) / (max - min)
+	Fill.Size = UDim2.new(initRatio, 0, 1, 0)
+	Fill.BackgroundColor3 = Color3.fromRGB(120, 120, 180)
+	Fill.BorderSizePixel = 0
+	Fill.Parent = Track
+	Instance.new("UICorner", Fill).CornerRadius = UDim.new(0, 5)
+
+	local Knob = Instance.new("Frame")
+	Knob.Size = UDim2.new(0, 18, 0, 18)
+	Knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	Knob.Position = UDim2.new(initRatio, 0, 0.5, 0)
+	Knob.BackgroundColor3 = Color3.fromRGB(240, 240, 255)
+	Knob.BorderSizePixel = 0
+	Knob.Parent = Track
+	Instance.new("UICorner", Knob).CornerRadius = UDim.new(1, 0)
+
+	local dragging = false
+
+	local function update(input)
+		local posX = math.clamp((input.Position.X - Track.AbsolutePosition.X) / Track.AbsoluteSize.X, 0, 1)
+		Fill.Size = UDim2.new(posX, 0, 1, 0)
+		Knob.Position = UDim2.new(posX, 0, 0.5, 0)
+
+		local value = min + (max - min) * posX
+		if isPercent then
+			Label.Text = string.format("%s: %d%%", text, math.floor(value * 100))
+		else
+			value = math.floor(value * 100 + 0.5) / 100
+			Label.Text = string.format("%s: %.2f", text, value)
+		end
+		callback(value)
+	end
+
+	ClickArea.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			MainFrame.Draggable = false
+			update(input)
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 and dragging then
+			dragging = false
+			MainFrame.Draggable = true
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+			update(input)
+		end
+	end)
+end
+
+-- === НАПОЛНЕНИЕ ВКЛАДОК ===
+CreateDropdown(MainPage, "Готовые цветовые схемы", ColorPresets, function(selectedOption)
+	UpdateReduxColors(selectedOption.Color)
+end)
+
+CreateSlider(MainPage, "Красный (R)", 0, 255, CustomColorR, false, function(val)
+	CustomColorR = math.floor(val)
+	UpdateReduxColors(Color3.fromRGB(CustomColorR, CustomColorG, CustomColorB))
+end)
+
+CreateSlider(MainPage, "Зеленый (G)", 0, 255, CustomColorG, false, function(val)
+	CustomColorG = math.floor(val)
+	UpdateReduxColors(Color3.fromRGB(CustomColorR, CustomColorG, CustomColorB))
+end)
+
+CreateSlider(MainPage, "Синий (B)", 0, 255, CustomColorB, false, function(val)
+	CustomColorB = math.floor(val)
+	UpdateReduxColors(Color3.fromRGB(CustomColorR, CustomColorG, CustomColorB))
+end)
+
+CreateSlider(MainPage, "Растяжение экрана (Stretch)", 0.50, 1.00, Resolution, false, function(val)
+	Resolution = val
+end)
+
+local del = CreateButton(MainPage, "ПОЛНЫЙ СБРОС И ВЫХОД (L)", Color3.fromRGB(170, 40, 50), DeactivateAndReset)
+del.Font = Enum.Font.GothamBold
+
+-- === ЗВУКИ ВЫСТРЕЛОВ ===
+local CycleBtn = CreateButton(SoundPage, "[ РЕЖИМ: Чередовать все звуки ]", Color3.fromRGB(120, 120, 140), function()
+	SelectedSoundIndex = 0
+	ForceRefreshSounds()
+end)
+
+for i, soundId in ipairs(CustomGunSounds) do
+	local SoundRow = Instance.new("Frame")
+	SoundRow.Size = UDim2.new(1, -10, 0, 36)
+	SoundRow.BackgroundColor3 = Color3.fromRGB(24, 24, 34)
+	SoundRow.Parent = SoundPage
+	Instance.new("UICorner", SoundRow).CornerRadius = UDim.new(0, 6)
+	
+	local SelectBtn = Instance.new("TextButton")
+	SelectBtn.Size = UDim2.new(0.68, -5, 1, -8)
+	SelectBtn.Position = UDim2.new(0, 4, 0, 4)
+	SelectBtn.BackgroundColor3 = Color3.fromRGB(33, 33, 46)
+	SelectBtn.Text = "Звук оружия #" .. i
+	SelectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	SelectBtn.Font = Enum.Font.GothamMedium
+	SelectBtn.TextSize = 11
+	SelectBtn.Parent = SoundRow
+	Instance.new("UICorner", SelectBtn).CornerRadius = UDim.new(0, 5)
+	
+	SelectBtn.MouseButton1Click:Connect(function()
+		SelectedSoundIndex = i
+		ForceRefreshSounds()
+		for _, row in pairs(SoundPage:GetChildren()) do
+			if row:IsA("Frame") and row:FindFirstChild("TextButton") then
+				row.TextButton.BackgroundColor3 = Color3.fromRGB(33, 33, 46)
+			end
+		end
+		CycleBtn.BackgroundColor3 = Color3.fromRGB(33, 33, 46)
+		SelectBtn.BackgroundColor3 = Color3.fromRGB(45, 140, 60)
+	end)
+
+	local PlayBtn = Instance.new("TextButton")
+	PlayBtn.Size = UDim2.new(0.32, -5, 1, -8)
+	PlayBtn.Position = UDim2.new(0.68, 2, 0, 4)
+	PlayBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 68)
+	PlayBtn.Text = "▶ Тест"
+	PlayBtn.TextColor3 = Color3.fromRGB(220, 220, 240)
+	PlayBtn.Font = Enum.Font.Gotham
+	PlayBtn.TextSize = 11
+	PlayBtn.Parent = SoundRow
+	Instance.new("UICorner", PlayBtn).CornerRadius = UDim.new(0, 5)
+	
+	PlayBtn.MouseButton1Click:Connect(function()
+		local testSound = Instance.new("Sound")
+		testSound.SoundId = soundId
+		testSound.Volume = 1
+		testSound.Parent = SoundService
+		testSound:Play()
+		testSound.Ended:Connect(function() testSound:Destroy() end)
+	end)
+end
+
+-- === ЗВУКИ БЕГА ===
+CreateSlider(FootstepPage, "Громкость шагов", 0.0, 3.0, FootstepVolume, true, function(val)
+	FootstepVolume = val
+	ForceRefreshSounds()
+end)
+
+local FootRow = Instance.new("Frame")
+FootRow.Size = UDim2.new(1, -10, 0, 44)
+FootRow.BackgroundColor3 = Color3.fromRGB(24, 24, 34)
+FootRow.Parent = FootstepPage
+Instance.new("UICorner", FootRow).CornerRadius = UDim.new(0, 6)
+
+local FootLabel = Instance.new("TextLabel")
+FootLabel.Size = UDim2.new(0.68, -10, 1, 0)
+FootLabel.Position = UDim2.new(0, 10, 0, 0)
+FootLabel.BackgroundTransparency = 1
+FootLabel.Text = "Кастомный звук шагов (135712042029119)"
+FootLabel.TextColor3 = Color3.fromRGB(220, 220, 245)
+FootLabel.Font = Enum.Font.GothamMedium
+FootLabel.TextSize = 11
+FootLabel.TextXAlignment = Enum.TextXAlignment.Left
+FootLabel.Parent = FootRow
+
+local PlayFootBtn = Instance.new("TextButton")
+PlayFootBtn.Size = UDim2.new(0.32, -5, 1, -12)
+PlayFootBtn.Position = UDim2.new(0.68, 2, 0, 6)
+PlayFootBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 68)
+PlayFootBtn.Text = "▶ Прослушать"
+PlayFootBtn.TextColor3 = Color3.fromRGB(220, 220, 240)
+PlayFootBtn.Font = Enum.Font.Gotham
+PlayFootBtn.TextSize = 11
+PlayFootBtn.Parent = FootRow
+Instance.new("UICorner", PlayFootBtn).CornerRadius = UDim.new(0, 5)
+
+PlayFootBtn.MouseButton1Click:Connect(function()
+	local testSound = Instance.new("Sound")
+	testSound.SoundId = SingleFootstepId
+	testSound.Volume = FootstepVolume
+	testSound.Parent = SoundService
+	testSound:Play()
+	testSound.Ended:Connect(function() testSound:Destroy() end)
+end)
+
+-- Горячая клавиша L для сброса
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not gameProcessed and input.KeyCode == Enum.KeyCode.L then DeactivateAndReset() end
+end)
+
+-- Старт
+ActivateFPSBoost()
+AnimateOpen()
